@@ -7,7 +7,7 @@
 #     day. "Delete every cache" clears the lot, the Docker layer cache included; the next builds just run slower.
 #
 # By hand only, with "Also prune images": keeps the newest versions of the jellyfish image on GHCR and deletes the rest.
-# Keep enough that whatever TrueNAS is running isn't among them. The repository needs the Admin role on the package
+# Keep enough that whatever TrueNAS is running isn't among them. Only the public repo prunes; it needs the Admin role on the package
 # for this (the package's settings > Manage Actions access).
 name: Cleanup
 
@@ -120,7 +120,8 @@ jobs:
 
   images:
     name: Old image versions
-    if: github.event_name == 'workflow_dispatch' && inputs.prune-images
+    # Only the public repo, which publishes the image, prunes it.
+    if: github.repository == 'rshouse3956/NextWave.Jellyfish' && github.event_name == 'workflow_dispatch' && inputs.prune-images
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

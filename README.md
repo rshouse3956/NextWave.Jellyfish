@@ -106,6 +106,9 @@ GitHub Actions (`.github/workflows/`):
 
 Images are published by CI; there is no manual push step. Image: `ghcr.io/rshouse3956/jellyfish`
 
+Only the public repository (`rshouse3956/NextWave.Jellyfish`) publishes and prunes the image; CI checks the repository
+name. Forks and other copies build the image to prove it works but never push it.
+
 | Tag | When |
 |---|---|
 | `latest` | Every push to `main` |
@@ -116,7 +119,7 @@ Branches and pull requests build the image without publishing it.
 
 One-time package settings (GitHub > Packages > jellyfish > Package settings), after the first publish:
 
-- **Manage Actions access:** give this repository the **Admin** role so the Cleanup workflow can prune old versions.
+- **Manage Actions access:** give the publishing repository the **Admin** role so CI can push and the Cleanup workflow can prune old versions.
 - **Visibility:** packages start private. Either make it public, or sign TrueNAS in to GHCR (below).
 
 To build the image locally instead:
