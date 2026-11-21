@@ -1,0 +1,133 @@
+# Keeps the repository's GitHub storage down: old artifacts, old workflow runs (with their logs) and stale caches.
+#
+# Weekly, and from the Actions tab (Cleanup > Run workflow), where each limit below can be changed for that run:
+#   - artifacts: all of them (CI doesn't keep any; anything left is from a one-off run);
+#   - workflow runs: completed runs older than 30 days, keeping each workflow's newest 10 whatever their age;
+#   - caches: those unused for 7 days, and other branches' and pull requests' caches (only they can use them) after a
+#     day. "Delete every cache" clears the lot, the Docker layer cache included; the next builds just run slower.
+#
+# By hand only, with "Also prune images": keeps the newest versions of the jellyfish image on GHCR and deletes the rest.
+# Keep enough that whatever TrueNAS is running isn't among them. The repository needs the Admin role on the package
+# for this (the package's settings > Manage Actions access).
+name: Cleanup
+
+on:
+  schedule:
+    - cron: '41 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      run-days:
+        description: Delete completed workflow runs older than this many days
+        type: number
+        default: 30
+      keep-runs:
+        description: Keep at least this many of each workflow's newest runs
+        type: number
+        default: 10
+      cache-days:
+        description: Delete caches unused for this many days
+        type: number
+        default: 7
+      all-caches:
+        description: Delete every cache
+        type: boolean
+        default: false
+      prune-images:
+        description: Also prune images (keep the newest versions)
+        type: boolean
+        default: false
+      keep-images:
+        description: Image versions to keep
+        type: number
+        default: 15
+
+permissions: {}
+
+concurrency:
+  group: cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Artifacts, runs and caches
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read # the default branch's name
+    steps:
+      - uses: actions/github-script@v9
+        env:
+          # A scheduled run has no inputs: the defaults above.
+          RUN_DAYS: ${{ inputs.run-days || 30 }}
+          KEEP_RUNS: ${{ inputs.keep-runs || 10 }}
+          CACHE_DAYS: ${{ inputs.cache-days || 7 }}
+          ALL_CACHES: ${{ inputs.all-caches || false }}
+        with:
+          script: |
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            const day = 24 * 60 * 60 * 1000;
+            const mb = bytes => `${(bytes / 1048576).toFixed(0)} MB`;
+            const summary = [];
+
+            // --- Artifacts: all of them ---
+            const artifacts = (await github.paginate(github.rest.actions.listArtifactsForRepo, { ...repo, per_page: 100 }))
+              .filter(a => !a.expired);
+            let artifactBytes = 0, artifactCount = 0;
+            for (const artifact of artifacts) {
+              await github.rest.actions.deleteArtifact({ ...repo, artifact_id: artifact.id });
+              artifactCount++;
+              artifactBytes += artifact.size_in_bytes;
+            }
+            summary.push(`${artifactCount} artifacts (${mb(artifactBytes)})`);
+
+            // --- Workflow runs: completed, old, and beyond each workflow's newest few ---
+            const runCutoff = Date.now() - Number(process.env.RUN_DAYS) * day;
+            const keepRuns = Number(process.env.KEEP_RUNS);
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, { ...repo, per_page: 100 });
+            const seen = new Map();
+            let runCount = 0;
+            for (const run of runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))) {
+              const newer = seen.get(run.workflow_id) ?? 0;
+              seen.set(run.workflow_id, newer + 1);
+              if (newer < keepRuns || run.status !== 'completed' || run.id === context.runId || new Date(run.created_at) >= runCutoff) {
+                continue;
+              }
+              await github.rest.actions.deleteWorkflowRun({ ...repo, run_id: run.id });
+              runCount++;
+            }
+            summary.push(`${runCount} workflow runs`);
+
+            // --- Caches: unused for a while, or another branch's or pull request's ---
+            const all = process.env.ALL_CACHES === 'true';
+            const cacheCutoff = Date.now() - Number(process.env.CACHE_DAYS) * day;
+            const main = `refs/heads/${(await github.rest.repos.get(repo)).data.default_branch}`;
+            const caches = await github.paginate(github.rest.actions.getActionsCacheList, { ...repo, per_page: 100 });
+            let cacheBytes = 0, cacheCount = 0;
+            for (const cache of caches) {
+              const used = new Date(cache.last_accessed_at).getTime();
+              const elsewhere = cache.ref !== main && !cache.ref.startsWith('refs/tags/') && used < Date.now() - day;
+              if (all || used < cacheCutoff || elsewhere) {
+                await github.rest.actions.deleteActionsCacheById({ ...repo, cache_id: cache.id });
+                cacheCount++;
+                cacheBytes += cache.size_in_bytes;
+              }
+            }
+            summary.push(`${cacheCount} caches (${mb(cacheBytes)})`);
+
+            core.notice(`Deleted ${summary.join(', ')}.`);
+            await core.summary.addHeading('Cleanup').addRaw(`Deleted ${summary.join(', ')}.`).write();
+
+  images:
+    name: Old image versions
+    if: github.event_name == 'workflow_dispatch' && inputs.prune-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: jellyfish
+          package-type: container
+          min-versions-to-keep: ${{ inputs.keep-images }}

@@ -1,0 +1,157 @@
+# Build and test every push and pull request; on main (and version tags) also publish the image to GHCR.
+# The image is the root Dockerfile: the Vue client built into the API's wwwroot.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  server:
+    name: Server build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # No global.json in this repository: the latest .NET 10 SDK.
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '.config/dotnet-tools.json') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # The tests solution references the API project, so this restores and builds both.
+      - name: Restore
+        run: dotnet restore NextWave.Jellyfish.Tests.sln
+
+      - name: Build
+        run: dotnet build NextWave.Jellyfish.Tests.sln -c Release --no-restore
+
+      # Unit tests only (Moq): no MongoDB or controller needed.
+      - name: Test
+        run: >
+          dotnet test NextWave.Jellyfish.Tests.sln -c Release --no-build
+          --logger "trx;LogFileName=results.trx"
+          --results-directory TestResults
+
+      - name: Test results summary
+        if: always()
+        run: |
+          trx=$(find TestResults -name '*.trx' | head -n 1)
+          if [ -z "$trx" ]; then echo "No test results found." >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          counters=$(grep -o '<Counters [^>]*>' "$trx" | head -n 1)
+          get() { echo "$counters" | grep -o "$1=\"[0-9]*\"" | grep -o '[0-9]*'; }
+          {
+            echo "### Tests"
+            echo "| Total | Passed | Failed |"
+            echo "|---|---|---|"
+            echo "| $(get total) | $(get passed) | $(get failed) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  web:
+    name: Web client
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 22 matches the client build stage in the Dockerfile.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # vue-tsc -b (type check), then the Vite build.
+      - name: Build
+        run: npm run build
+
+  image:
+    name: Container image
+    needs: [server, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Only main and version tags publish; other branches and pull requests just prove the image builds.
+      PUBLISH: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Sign in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # latest on main, sha-<commit> always, and X.Y.Z / X.Y for tags like v1.2.3. The source label links the package
+      # to this repository.
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/jellyfish
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # One plain image per push: no attestation manifests, which GHCR lists as extra untagged versions that the
+          # cleanup workflow couldn't delete without breaking the image they belong to.
+          provenance: false
+          sbom: false
+          # The layer cache only speeds builds up: a failed cache write must not fail a build whose image is pushed.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image"
+            if [ "$PUBLISH" = "true" ]; then echo "Published:"; else echo "Built (not published):"; fi
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

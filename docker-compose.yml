@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: jellyfish-mongo
+    restart: unless-stopped
+    # Publish Mongo only if another machine needs it (e.g. Compass); the API reaches it on the compose network.
+    # ports:
+    #   - "27018:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASS}
+    volumes:
+      - mongo_data:/data/db
+      
+  mongo-express:
+    image: mongo-express
+    container_name: jellyfish-mongo-express
+    restart: unless-stopped
+    ports:
+      - 8086:8081
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_USER}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_PASS}
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_USER}:${MONGO_PASS}@mongo:27017/
+      # Login for the web UI (set ME_USER and ME_PASS in .env)
+      ME_CONFIG_BASICAUTH: "true"
+      ME_CONFIG_BASICAUTH_USERNAME: ${ME_USER:?Set ME_USER in .env}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${ME_PASS:?Set ME_PASS in .env}
+
+  jellyfish-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jellyfish-api
+    depends_on:
+      - mongo
+    ports:
+      # Map host 8085 to container's HTTP endpoint (appsettings uses 5300)
+      - "8085:5300"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      # Point API to the compose Mongo instance
+      - Mongo__ConnectionString=mongodb://${MONGO_USER}:${MONGO_PASS}@mongo:27017/
+      - Mongo__DatabaseName=${DB_NAME:-jellyfish}
+      # Location for sunrise/sunset schedules (decimal degrees, metres)
+      - Schedule__Latitude=${SCHEDULE_LATITUDE:?Set SCHEDULE_LATITUDE in .env}
+      - Schedule__Longitude=${SCHEDULE_LONGITUDE:?Set SCHEDULE_LONGITUDE in .env}
+      - Schedule__ElevationMeters=${SCHEDULE_ELEVATION_METERS:-0}
+      # Controller address, e.g. CONTROLLER_WS_URI=ws://10.0.0.x:9000/ws in .env
+      - JellyfishController__WebSocketUri=${CONTROLLER_WS_URI:?Set CONTROLLER_WS_URI in .env}
+      # Pattern assistant (off unless PATTERN_ASSISTANT_ENABLED=true in .env)
+      - PatternAssistant__Enabled=${PATTERN_ASSISTANT_ENABLED:-false}
+      - PatternAssistant__BaseUrl=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - PatternAssistant__Model=${OLLAMA_MODEL:-qwen2.5:7b}
+    # If you want to see logs in local time, pass TZ (Linux images only)
+    # environment:
+    #   - TZ=America/Denver
+
+  # Ollama for the pattern assistant. Only started with the "assistant" profile:
+  #   docker compose --profile assistant up -d
+  #   docker exec jellyfish-ollama ollama pull qwen2.5:7b
+  ollama:
+    image: ollama/ollama:latest
+    container_name: jellyfish-ollama
+    restart: unless-stopped
+    profiles: ["assistant"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # NVIDIA GPU (needs the NVIDIA Container Toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+volumes:
+  mongo_data:
+  ollama_data:
+
